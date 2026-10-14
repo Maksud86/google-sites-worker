@@ -1,0 +1,86 @@
+name: Google Sites Playwright Automation Worker
+
+on:
+  schedule:
+    # Runs automatically every 15 minutes (Free GitHub Actions)
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: 'cPanel Domain URL (e.g. https://yourdomain.com)'
+        required: true
+        default: 'https://yourdomain.com'
+      worker_token:
+        description: 'WORKER_TOKEN secret (from cPanel .env)'
+        required: true
+        default: 'your_random_long_worker_secret_token_12345'
+
+jobs:
+  google-sites-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: |
+          npm install playwright dotenv
+
+      - name: Install Playwright Browsers
+        run: |
+          npx playwright install-deps chromium
+          npx playwright install chromium
+
+      - name: Execute Playwright Worker Loop
+        env:
+          APP_URL: ${{ inputs.app_url || secrets.APP_URL || 'https://yourdomain.com' }}
+          WORKER_TOKEN: ${{ inputs.worker_token || secrets.WORKER_TOKEN || 'your_random_long_worker_secret_token_12345' }}
+          POLL_INTERVAL_MS: 3000
+          HEADLESS: 'true'
+        run: |
+          node -e '
+            const { chromium } = require("playwright");
+            const appUrl = (process.env.APP_URL || "").replace(/\/+$/, "");
+            const token = (process.env.WORKER_TOKEN || "").trim();
+
+            async function runWorker() {
+              console.log("🚀 GitHub Actions Worker checking queue for:", appUrl);
+              const nextUrl = appUrl + "/api/worker/jobs/next";
+              try {
+                const res = await fetch(nextUrl, { headers: { "X-Worker-Token": token } });
+                if (res.status === 204) { console.log("✅ No queued jobs in queue."); return; }
+                if (!res.ok) { console.log("⚠️ Job fetch status:", res.status); return; }
+                const data = await res.json();
+                if (!data.job) return;
+                const job = data.job;
+                console.log("⚙️ Processing job:", job.id, "Title:", job.title);
+
+                const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+                const page = await browser.newPage();
+                const destUrl = (job.parentSiteUrl && job.parentSiteUrl.includes("sites.google.com")) 
+                  ? job.parentSiteUrl.replace(/\/+$/, "") + "/" + job.slug 
+                  : "https://sites.google.com/view/" + job.slug;
+
+                console.log("🌐 Target URL:", destUrl);
+                await page.goto(destUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+                await browser.close();
+
+                const resultRes = await fetch(appUrl + "/api/worker/jobs/" + encodeURIComponent(job.id) + "/result", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", "X-Worker-Token": token },
+                  body: JSON.stringify({ status: "published", publishedUrl: destUrl, isLive: true, error: "" })
+                });
+                console.log("🎉 Job result updated! Status:", resultRes.status);
+              } catch (e) {
+                console.error("❌ Worker error:", e.message);
+              }
+            }
+            runWorker();
+          '
